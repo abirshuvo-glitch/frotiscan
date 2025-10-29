@@ -1,5 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.30.0
-httpx==0.27.0
-dnspython==2.6.1
-
+fastapi
+uvicorn
+aiohttp
+requests
+tldextract
+cryptography
+beautifulsoup4
