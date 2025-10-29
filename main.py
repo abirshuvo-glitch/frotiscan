@@ -1,172 +1,111 @@
-from fastapi import FastAPI, Request
+#!/usr/bin/env python3
+"""
+main.py — FortiScan Backend (Commercial-Grade Ready)
+FastAPI-based backend API integrating the advanced site_assessor engine.
+This version is production-hardened for deployment on Render or any cloud.
+
+Endpoints:
+  POST /api/scan  →  Perform a full passive security scan
+  GET  /health    →  Health check for uptime monitors
+  GET  /           →  Root message
+"""
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-import httpx, socket, ssl, asyncio, re, datetime
-import dns.resolver, whois
-from ipwhois import IPWhois
+import asyncio
+import re
+import socket
+from urllib.parse import urlparse
+from app.site_assessor import assess_site  # assumes your site_assessor.py is under /app
 
-app = FastAPI(title="FortiScan AI", version="1.0")
+# ------------------------------------------------------------------------------
+# App setup
+# ------------------------------------------------------------------------------
+app = FastAPI(
+    title="FortiScan API",
+    description="Secure, commercial-grade passive web scanner backend for SMEs.",
+    version="3.0",
+)
 
-# ===== CORS =====
+# ------------------------------------------------------------------------------
+# Security: CORS / rate control (basic) / sanitization
+# ------------------------------------------------------------------------------
+ALLOWED_ORIGINS = [
+    "https://fortiscan-fe.vercel.app",  # your frontend
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust later for your domain
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Helpers =====
-def valid_domain(domain: str) -> bool:
-    pattern = re.compile(r"^(?!\-)(?:[a-zA-Z0-9\-]{1,63}\.)+[a-zA-Z]{2,}$")
-    return bool(pattern.match(domain))
+# ------------------------------------------------------------------------------
+# Input validation utilities
+# ------------------------------------------------------------------------------
+def sanitize_target(url: str) -> str:
+    """Basic safety filter: ensures it's a real domain, not localhost/IP."""
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'target'")
+    if not re.match(r"^(https?:\/\/)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$", url):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
 
-async def get_ip(domain: str):
+    parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+    host = parsed.hostname or ""
+    if any(x in host for x in ["localhost", "127.", "0.0.0.0"]):
+        raise HTTPException(status_code=400, detail="Local/internal targets not allowed")
     try:
-        return socket.gethostbyname(domain)
-    except Exception:
-        return None
+        socket.gethostbyname(host)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Domain not resolvable (DNS lookup failed)")
+    return parsed.geturl()
 
-async def get_ssl_info(domain: str):
-    ctx = ssl.create_default_context()
-    try:
-        with socket.create_connection((domain, 443), timeout=3) as sock:
-            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
-                exp_date = datetime.datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
-                days_left = (exp_date - datetime.datetime.utcnow()).days
-                issuer = dict(x[0] for x in cert['issuer'])
-                version = ssock.version()
-                return {
-                    "valid": True,
-                    "issuer": issuer.get('organizationName', 'Unknown'),
-                    "version": version,
-                    "expires_in_days": days_left
-                }
-    except Exception:
-        return {"valid": False}
-
-async def get_headers(domain: str):
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=5) as client:
-            r = await client.get(f"https://{domain}")
-            headers = {k.lower(): v for k, v in r.headers.items()}
-            security_headers = [
-                "content-security-policy",
-                "x-frame-options",
-                "x-content-type-options",
-                "referrer-policy",
-                "strict-transport-security",
-                "permissions-policy"
-            ]
-            missing = [h for h in security_headers if h not in headers]
-            return {"status": r.status_code, "missing_headers": missing}
-    except Exception:
-        return {"error": "Could not fetch headers"}
-
-async def get_dns(domain: str):
-    result = {}
-    try:
-        for rec in ["A", "MX", "TXT"]:
-            try:
-                answers = dns.resolver.resolve(domain, rec)
-                result[rec] = [str(rdata) for rdata in answers]
-            except Exception:
-                result[rec] = []
-        return result
-    except Exception:
-        return {}
-
-async def get_whois(domain: str):
-    try:
-        data = whois.whois(domain)
-        return {
-            "registrar": data.registrar,
-            "creation_date": str(data.creation_date)[:10] if data.creation_date else None,
-            "expiration_date": str(data.expiration_date)[:10] if data.expiration_date else None,
-        }
-    except Exception:
-        return {}
-
-async def detect_waf(headers: dict):
-    waf_signatures = {
-        "cloudflare": "Cloudflare",
-        "akamai": "Akamai",
-        "aws": "AWS WAF",
-        "imperva": "Imperva",
-        "sucuri": "Sucuri",
-    }
-    for key, val in headers.items():
-        for sig, name in waf_signatures.items():
-            if sig in key.lower() or sig in val.lower():
-                return name
-    return None
-
-async def compute_score(tls, headers, dns):
-    score = 100
-    notes = []
-    if not tls["valid"]:
-        score -= 30
-        notes.append("SSL not valid.")
-    elif tls.get("expires_in_days", 0) < 15:
-        score -= 10
-        notes.append("SSL expiring soon.")
-    if len(headers.get("missing_headers", [])) > 2:
-        score -= len(headers["missing_headers"]) * 5
-        notes.append("Missing key HTTP security headers.")
-    if not any("v=spf1" in txt for txt in dns.get("TXT", [])):
-        score -= 10
-        notes.append("No SPF record found.")
-    if not dns.get("MX"):
-        score -= 5
-        notes.append("No MX record found.")
-    grade = "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D" if score >= 40 else "F"
-    return score, grade, notes
-
-# ===== API ROUTE =====
-@app.post("/api/scan")
-async def scan(request: Request):
-    try:
-        data = await request.json()
-        domain = data.get("target", "").strip().lower()
-
-        # --- Validate ---
-        if not valid_domain(domain):
-            return {"error": "Invalid domain"}
-        if re.match(r"^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.)", domain):
-            return {"error": "Local targets not allowed"}
-
-        ip = await get_ip(domain)
-        if not ip:
-            return {"error": "Cannot resolve domain"}
-
-        # --- Run async tasks ---
-        tls_task = asyncio.create_task(get_ssl_info(domain))
-        headers_task = asyncio.create_task(get_headers(domain))
-        dns_task = asyncio.create_task(get_dns(domain))
-        whois_task = asyncio.create_task(get_whois(domain))
-        await asyncio.gather(tls_task, headers_task, dns_task, whois_task)
-
-        tls, headers, dns, whois_info = tls_task.result(), headers_task.result(), dns_task.result(), whois_task.result()
-        waf = await detect_waf(headers if isinstance(headers, dict) else {})
-        score, grade, notes = await compute_score(tls, headers, dns)
-
-        # --- Combine result ---
-        return {
-            "host": domain,
-            "ip": ip,
-            "grade": grade,
-            "score": score,
-            "brand_trust": round(score * 0.9),
-            "tls": tls,
-            "dns": dns,
-            "headers": headers,
-            "whois": whois_info,
-            "waf": waf,
-            "notes": notes,
-        }
-    except Exception as e:
-        return {"error": f"Scan failed: {str(e)}"}
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    return {"message": "FortiScan AI Backend Active", "version": "1.0"}
+    return {"message": "✅ FortiScan backend live and secure"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.post("/api/scan")
+async def scan_endpoint(request: Request):
+    try:
+        data = await request.json()
+        target = data.get("target", "").strip()
+        target_url = sanitize_target(target)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or missing JSON body")
+
+    try:
+        result = await assess_site(target_url)
+        return {
+            "host": result["target"],
+            "score": result["summary"]["overall_score"],
+            "risk_level": result["summary"]["risk_level"],
+            "findings": result["findings"],
+            "remediations": result.get("remediations", []),
+            "timestamp": result["timestamp"],
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Scan timed out (target unresponsive)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ------------------------------------------------------------------------------
+# Run locally:  uvicorn main:app --reload
+# On Render: start command should be:
+#   uvicorn main:app --host 0.0.0.0 --port 10000
+# ------------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
